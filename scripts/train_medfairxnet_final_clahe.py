@@ -1,0 +1,313 @@
+"""
+MELONMA - MEDFAIRXNET FINAL CLAHE TRAINING
+============================================================
+Proposed model training script. Mirrors the conventions used in
+train_efficientnetv2_final_clahe.py / train_densenet121_final_clahe.py
+so it drops straight into the existing project folder structure:
+
+    <project_root>/
+        data/processed/final_binary_clahe_splits/
+            train_final_clahe.csv
+            validation_final_clahe.csv
+        models/
+        results/
+
+Run this file from inside the project's scripts/ folder (same place
+as the other train_*.py scripts), after copying medfairxnet_model.py
+into that same scripts/ folder.
+
+    python train_medfairxnet_final_clahe.py
+
+Two-stage fine-tuning:
+    Stage 1: backbone mostly frozen, head trained (fast, stable)
+    Stage 2: full backbone unfrozen at a low LR (better accuracy)
+Both stages log to the same history CSV, and the best-val-AUC weights
+are checkpointed to MODEL_PATH.
+"""
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.utils.class_weight import compute_class_weight
+
+from medfairxnet_model import build_medfairxnet, IMAGE_SIZE
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+DATA_DIR = BASE_DIR / "data" / "processed" / "final_binary_clahe_splits"
+TRAIN_CSV = DATA_DIR / "train_final_clahe.csv"
+VAL_CSV = DATA_DIR / "validation_final_clahe.csv"
+
+MODEL_DIR = BASE_DIR / "models"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+RESULTS_DIR = BASE_DIR / "results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_PATH = MODEL_DIR / "melanoma_medfairxnet_final_clahe.keras"
+HISTORY_PATH = RESULTS_DIR / "medfairxnet_final_clahe_training_history.csv"
+
+BATCH_SIZE = 8
+STAGE1_EPOCHS = 15
+STAGE2_EPOCHS = 10
+RANDOM_SEED = 42
+
+# Optional: subgroup column used for a fairness-aware sample-weight
+# nudge. If it isn't present in your CSV, this is skipped automatically
+# (no assumption is made about your data).
+SUBGROUP_CANDIDATES = ["dataset_source", "source", "dataset"]
+
+tf.random.set_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+print("=" * 75)
+print("MELONMA - MEDFAIRXNET FINAL CLAHE TRAINING")
+print("=" * 75)
+print("\nTensorFlow version:", tf.__version__)
+print("Train CSV:", TRAIN_CSV)
+print("Validation CSV:", VAL_CSV)
+print("Model output:", MODEL_PATH)
+
+if not TRAIN_CSV.exists():
+    raise FileNotFoundError(f"Training CSV not found:\n{TRAIN_CSV}")
+if not VAL_CSV.exists():
+    raise FileNotFoundError(f"Validation CSV not found:\n{VAL_CSV}")
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+train_df = pd.read_csv(TRAIN_CSV)
+val_df = pd.read_csv(VAL_CSV)
+
+required_columns = ["image_id", "image_path", "binary_label", "binary_diagnosis"]
+for column in required_columns:
+    if column not in train_df.columns:
+        raise ValueError(f"Missing column in training CSV: {column}")
+    if column not in val_df.columns:
+        raise ValueError(f"Missing column in validation CSV: {column}")
+
+train_df["label"] = train_df["binary_label"].astype(int)
+val_df["label"] = val_df["binary_label"].astype(int)
+
+
+def make_absolute_path(path):
+    path = Path(str(path))
+    return str(path) if path.is_absolute() else str(BASE_DIR / path)
+
+
+train_df["image_path"] = train_df["image_path"].apply(make_absolute_path)
+val_df["image_path"] = val_df["image_path"].apply(make_absolute_path)
+
+missing_train = train_df[~train_df["image_path"].apply(lambda p: Path(p).exists())]
+missing_val = val_df[~val_df["image_path"].apply(lambda p: Path(p).exists())]
+
+if len(missing_train) > 0 or len(missing_val) > 0:
+    raise FileNotFoundError(
+        f"Missing images -> train: {len(missing_train)}, val: {len(missing_val)}"
+    )
+
+print("\nTraining images   :", len(train_df))
+print("Validation images :", len(val_df))
+print("\nTrain class distribution:\n", train_df["binary_diagnosis"].value_counts())
+print("\nVal class distribution:\n", val_df["binary_diagnosis"].value_counts())
+
+
+# ============================================================
+# CLASS WEIGHTS (imbalance handling — same approach as baselines)
+# ============================================================
+
+class_weights_array = compute_class_weight(
+    class_weight="balanced",
+    classes=np.array([0, 1]),
+    y=train_df["label"].to_numpy(),
+)
+class_weight_dict = {0: class_weights_array[0], 1: class_weights_array[1]}
+print("\nClass weights:", class_weight_dict)
+
+
+# ============================================================
+# OPTIONAL FAIRNESS SAMPLE-WEIGHT NUDGE
+# (only activates if a subgroup/source column actually exists)
+# ============================================================
+
+subgroup_col = next((c for c in SUBGROUP_CANDIDATES if c in train_df.columns), None)
+
+if subgroup_col is not None:
+    print(f"\nFairness subgroup column detected: '{subgroup_col}'")
+    print(train_df[subgroup_col].value_counts())
+
+    group_counts = train_df[subgroup_col].value_counts()
+    inverse_freq = group_counts.sum() / group_counts
+    inverse_freq = inverse_freq / inverse_freq.mean()  # normalize around 1.0
+
+    train_df["fairness_weight"] = train_df[subgroup_col].map(inverse_freq)
+else:
+    print(
+        "\nNo dataset-source column found in the CSV "
+        f"(looked for {SUBGROUP_CANDIDATES}). "
+        "Skipping fairness sample-weight nudge; class weights still apply."
+    )
+    train_df["fairness_weight"] = 1.0
+
+train_df["sample_weight"] = train_df["label"].map(class_weight_dict) * train_df["fairness_weight"]
+
+
+# ============================================================
+# tf.data PIPELINES
+# ============================================================
+
+def load_image(path, label, weight):
+    image = tf.io.read_file(path)
+    image = tf.image.decode_jpeg(image, channels=3)
+    image = tf.image.resize(image, IMAGE_SIZE)
+    image = tf.cast(image, tf.float32) / 255.0
+    mean = tf.constant([0.485, 0.456, 0.406])
+    std = tf.constant([0.229, 0.224, 0.225])
+    image = (image - mean) / std
+    return image, label, weight
+
+
+def augment(image, label, weight):
+    image = tf.image.random_flip_left_right(image)
+    image = tf.image.random_flip_up_down(image)
+    image = tf.image.random_brightness(image, 0.1)
+    image = tf.image.random_contrast(image, 0.9, 1.1)
+    return image, label, weight
+
+
+def build_dataset(df, training):
+    paths = df["image_path"].to_numpy()
+    labels = df["label"].to_numpy().astype("float32")
+    weights = df.get("sample_weight", pd.Series(np.ones(len(df)))).to_numpy().astype("float32")
+
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels, weights))
+    if training:
+        ds = ds.shuffle(buffer_size=len(df), seed=RANDOM_SEED)
+    ds = ds.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
+    if training:
+        ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
+train_ds = build_dataset(train_df, training=True)
+val_ds = build_dataset(val_df, training=False)
+
+
+# ============================================================
+# BUILD MODEL
+# ============================================================
+
+print("\n" + "=" * 75)
+print("STAGE 1: HEAD TRAINING (BACKBONE MOSTLY FROZEN)")
+print("=" * 75)
+
+model = build_medfairxnet(image_size=IMAGE_SIZE, freeze_backbone_until=200)
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+    loss="binary_crossentropy",
+    metrics=[
+        tf.keras.metrics.AUC(name="auc"),
+        tf.keras.metrics.AUC(name="pr_auc", curve="PR"),
+        "accuracy",
+    ],
+)
+
+callbacks_stage1 = [
+    tf.keras.callbacks.ModelCheckpoint(
+        str(MODEL_PATH), monitor="val_auc", mode="max",
+        save_best_only=True, verbose=1,
+    ),
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_auc", mode="max", patience=5,
+        restore_best_weights=True, verbose=1,
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_auc", mode="max", factor=0.5,
+        patience=3, min_lr=1e-7, verbose=1,
+    ),
+]
+
+history_stage1 = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=STAGE1_EPOCHS,
+    callbacks=callbacks_stage1,
+    verbose=1,
+)
+
+print("\n" + "=" * 75)
+print("STAGE 2: FULL FINE-TUNING (LOW LEARNING RATE)")
+print("=" * 75)
+
+for layer in model.layers:
+    layer.trainable = True
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    loss="binary_crossentropy",
+    metrics=[
+        tf.keras.metrics.AUC(name="auc"),
+        tf.keras.metrics.AUC(name="pr_auc", curve="PR"),
+        "accuracy",
+    ],
+)
+
+callbacks_stage2 = [
+    tf.keras.callbacks.ModelCheckpoint(
+        str(MODEL_PATH), monitor="val_auc", mode="max",
+        save_best_only=True, verbose=1,
+    ),
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_auc", mode="max", patience=5,
+        restore_best_weights=True, verbose=1,
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_auc", mode="max", factor=0.5,
+        patience=2, min_lr=1e-8, verbose=1,
+    ),
+]
+
+history_stage2 = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=STAGE2_EPOCHS,
+    callbacks=callbacks_stage2,
+    verbose=1,
+)
+
+
+# ============================================================
+# SAVE COMBINED TRAINING HISTORY
+# ============================================================
+
+hist1_df = pd.DataFrame(history_stage1.history)
+hist1_df["stage"] = 1
+
+hist2_df = pd.DataFrame(history_stage2.history)
+hist2_df["stage"] = 2
+
+combined_history = pd.concat([hist1_df, hist2_df], ignore_index=True)
+combined_history.to_csv(HISTORY_PATH, index=False)
+
+print("\n" + "=" * 75)
+print("TRAINING COMPLETE")
+print("=" * 75)
+print("\nBest model saved to:", MODEL_PATH)
+print("Training history saved to:", HISTORY_PATH)
+print("\nNext step: run evaluate_medfairxnet_final_clahe.py")

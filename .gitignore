@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Datasets
+data/
+
+# Trained models
+models/
+*.keras
+
+# Generated results
+results/
+
+# Archives
+*.zip
